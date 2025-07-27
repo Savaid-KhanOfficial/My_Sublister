@@ -1,0 +1,13 @@
+{
+    "Google": "https://google.com/search?q={query}&btnG=Search&hl=en-US&biw=&bih=&gbv=1&start={page_no}&filter=0",
+    "Yahoo": "https://search.yahoo.com/search?p={query}&b={page_no}",
+    "Bing": "https://www.bing.com/search?q={query}&first={page_no}",
+    "Ask": "http://www.ask.com/web?q={query}&page={page_no}&qid=8D6EE6BF52E0C04527E51F64F22C4534&o=0&l=dir&qsrc=998&qo=pagination",
+    "Baidu": "https://www.baidu.com/s?pn={page_no}&wd={query}&oq={query}",
+    "Netcraft": "https://searchdns.netcraft.com/?q={domain}",
+    "Virustotal": "https://www.virustotal.com/ui/domains/{domain}/subdomains",
+    "ThreatCrowd": "https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={domain}",
+    "DNSdumpster": "https://dnsdumpster.com/",
+    "CrtSearch": "https://crt.sh/?q=%25.{domain}",
+    "PassiveDNS": "https://api.sublist3r.com/search.php?domain={domain}"
+}
