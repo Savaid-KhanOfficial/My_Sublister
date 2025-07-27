@@ -20,7 +20,10 @@ import requests
 
 # Disable SSL warnings
 try:
-    requests.packages.urllib3.disable_warnings()
+    # This specifically disables warnings for insecure requests, but
+    # it's generally better to fix the root cause (e.g., certificate issues)
+    # or ensure proper certificate verification.
+    requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 except AttributeError:
     # requests.packages.urllib3 might not exist in some environments
     pass
@@ -141,10 +144,25 @@ class enumratorBase(object):
         self.print_(f"{G}Searching now in {self.engine_name}...{W}")
         return
 
-    def send_req(self, query, page_no=1):
-        url = self.base_url.format(query=query, page_no=page_no)
+    def send_req(self, query_or_url, page_no=1, method='GET', data=None, cookies=None):
+        """
+        Sends an HTTP request to the target URL.
+        :param query_or_url: The query string for search engines or full URL for direct API calls.
+        :param page_no: Page number for search engine pagination.
+        :param method: HTTP method (GET or POST).
+        :param data: Data for POST requests.
+        :param cookies: Cookies for the request.
+        """
+        if self.engine_name in ["Netcraft", "Virustotal", "ThreatCrowd", "DNSdumpster", "PassiveDNS", "CrtSearch"]:
+            url = query_or_url # For these, query_or_url is typically the full URL
+        else:
+            url = self.base_url.format(query=query_or_url, page_no=page_no)
+        
         try:
-            resp = self.session.get(url, headers=self.headers, timeout=self.timeout)
+            if method == 'GET':
+                resp = self.session.get(url, headers=self.headers, timeout=self.timeout, cookies=cookies)
+            elif method == 'POST':
+                resp = self.session.post(url, headers=self.headers, timeout=self.timeout, data=data, cookies=cookies)
             resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         except requests.exceptions.Timeout:
             logger.warning(f"{Y}Timeout occurred for {self.engine_name} at {url}{W}")
@@ -152,8 +170,14 @@ class enumratorBase(object):
         except requests.exceptions.TooManyRedirects:
             logger.warning(f"{Y}Too many redirects for {self.engine_name} at {url}{W}")
             return None
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.HTTPError as e:
             logger.error(f"{R}Request failed for {self.engine_name} at {url}: {e}{W}")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"{R}Connection error for {self.engine_name} at {url}: {e}{W}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"{R}An unexpected request error occurred for {self.engine_name} at {url}: {e}{W}")
             return None
         return self.get_response(resp)
 
@@ -199,6 +223,7 @@ class enumratorBase(object):
             if self.check_max_pages(page_no):
                 return self.subdomains
             
+            # send_req method now handles full URLs or queries depending on engine_name
             resp = self.send_req(query, page_no)
 
             if resp is None or not self.check_response_errors(resp):
@@ -347,12 +372,9 @@ class AskEnum(enumratorBaseThreaded):
         time.sleep(random.randint(1, 5)) # Random sleep
 
     def generate_query(self):
-        if self.subdomains:
-            found = ' -domain:'.join(self.subdomains[:self.MAX_DOMAINS])
-            query = f'site:{self.domain} -domain:www.{self.domain} -domain:{found}'
-        else:
-            query = f"site:{self.domain}"
-        return query
+        # Simplified query for Ask.com to avoid "Bad Request" errors
+        # Ask.com seems sensitive to complex query filters like -www.domain or -found
+        return f"site:{self.domain}"
 
 
 class BingEnum(enumratorBaseThreaded):
@@ -438,39 +460,66 @@ class NetcraftEnum(enumratorBaseThreaded):
         self.MAX_DOMAINS = 0
         self.MAX_PAGES = 0
         super().__init__("Netcraft", domain, subdomains, q=q, silent=silent, verbose=verbose)
-        self.url = self.base_url.format(domain=self.domain)
+        self.url_template = self.base_url # Store template, will format in enumerate
 
     def get_cookies(self, headers):
         cookies = {}
         if 'set-cookie' in headers:
-            cookies_list = headers['set-cookie'].split("=")
-            cookies[cookies_list[0]] = cookies_list[1].split(';')[0]
-            # hashlib.sha1 requires utf-8 encoded str
-            cookies['netcraft_js_verification_response'] = hashlib.sha1(unquote(cookies_list[1].split(';')[0]).encode('utf-8')).hexdigest()
+            for cookie_str in headers.get_list('set-cookie'): # Use get_list for multiple Set-Cookie headers
+                parts = cookie_str.split(';')[0].split('=')
+                if len(parts) == 2:
+                    key, value = parts[0], parts[1]
+                    cookies[key] = value
+                    if key == 'netcraft_js_verification': # Specific cookie for Netcraft
+                        # hashlib.sha1 requires utf-8 encoded str
+                        cookies['netcraft_js_verification_response'] = hashlib.sha1(unquote(value).encode('utf-8')).hexdigest()
         return cookies
 
     def enumerate(self):
-        start_url = self.base_url.format(domain='example.com')
-        resp = self.send_req(start_url, cookies={}) # Pass empty cookies initially
-        if resp is None:
+        # Initial request to get the session and potentially the first set-cookie headers
+        # Use a dummy domain for the initial request to get cookies if needed.
+        # Netcraft uses the 'q' parameter in its base_url for the domain.
+        initial_url = self.url_template.format(domain='example.com')
+        resp_initial = self.send_req(initial_url, cookies={}) # Pass empty cookies initially
+        
+        if resp_initial is None:
             return self.subdomains
 
-        cookies = self.get_cookies(requests.Response().headers) # Get headers from a dummy response
+        # Extract cookies from the response headers of the initial request
+        # This requires accessing the raw response object, which `send_req` doesn't return directly.
+        # We need a different approach for Netcraft to get the cookies.
+        
+        # Re-initialize session to get fresh cookies from first request, as Netcraft needs it.
+        self.session = requests.Session()
+        try:
+            initial_response_obj = self.session.get(initial_url, headers=self.headers, timeout=self.timeout)
+            initial_response_obj.raise_for_status()
+            cookies = self.get_cookies(initial_response_obj.headers)
+            current_url = self.url_template.format(domain=self.domain)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"{R}Initial request to Netcraft failed: {e}{W}")
+            return self.subdomains
 
-        url = self.base_url.format(domain=self.domain)
         while True:
-            resp_content = self.send_req(url, cookies=cookies) # Pass the extracted cookies
+            resp_content = self.send_req(current_url, method='GET', cookies=cookies)
             if resp_content is None:
-                return self.subdomains
+                break
 
             self.extract_domains(resp_content)
             
-            # Check for "Next Page" link
+            # Find the "Next Page" link
             next_page_match = re.search(r'<a href="([^"]+)">Next Page<\/a>', resp_content)
             if not next_page_match:
-                break
-            url = urlparse(url).scheme + "://" + urlparse(url).netloc + next_page_match.group(1)
+                break # No more pages
+
+            # Construct the next URL (Netcraft uses relative paths)
+            next_relative_path = next_page_match.group(1)
+            # Ensure we're building an absolute URL if the path is relative
+            current_url_parsed = urlparse(current_url)
+            current_url = f"{current_url_parsed.scheme}://{current_url_parsed.netloc}{next_relative_path}"
+            
             self.should_sleep()
+
         return self.subdomains
 
 
@@ -497,15 +546,6 @@ class Virustotal(enumratorBaseThreaded):
         super().__init__("Virustotal", domain, subdomains, q=q, silent=silent, verbose=verbose)
         self.url = self.base_url.format(domain=self.domain)
 
-    def send_req(self, url):
-        try:
-            resp = self.session.get(url, headers=self.headers, timeout=self.timeout)
-            resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"{R}Request failed for {self.engine_name} at {url}: {e}{W}")
-            return None
-        return self.get_response(resp)
-
     def enumerate(self):
         while self.url:
             resp = self.send_req(self.url)
@@ -514,7 +554,7 @@ class Virustotal(enumratorBaseThreaded):
             try:
                 resp_json = json.loads(resp)
             except json.JSONDecodeError as e:
-                logger.error(f"{R}Error decoding JSON from {self.engine_name}: {e}{W}")
+                logger.error(f"{R}Error decoding JSON from {self.engine_name}: {e}. Response was: {resp[:200]}...{W}") # Show snippet of bad response
                 break
 
             if 'error' in resp_json:
@@ -527,8 +567,12 @@ class Virustotal(enumratorBaseThreaded):
                 self.url = '' # No more pages
 
             self.extract_domains(resp_json) # Pass parsed JSON
+            self.should_sleep() # Add sleep after each request to avoid rate limits
 
         return self.subdomains
+
+    def should_sleep(self):
+        time.sleep(random.randint(5, 15)) # Add sleep to avoid rate limits
 
     def extract_domains(self, resp):
         # resp is already parsed as json
@@ -554,6 +598,9 @@ class ThreatCrowd(enumratorBaseThreaded):
         try:
             resp = self.session.get(url, headers=self.headers, timeout=self.timeout)
             resp.raise_for_status()
+        except requests.exceptions.SSLError as e: # Catch specific SSL error
+            logger.error(f"{R}SSL Error for {self.engine_name} at {url}: {e}. This might be an issue with the target server's certificate. Skipping.{W}")
+            return None
         except requests.exceptions.RequestException as e:
             logger.error(f"{R}Request failed for {self.engine_name} at {url}: {e}{W}")
             return None
@@ -568,11 +615,12 @@ class ThreatCrowd(enumratorBaseThreaded):
         try:
             resp_json = json.loads(resp)
         except json.JSONDecodeError as e:
-            logger.error(f"{R}Error decoding JSON from {self.engine_name}: {e}{W}")
+            logger.error(f"{R}Error decoding JSON from {self.engine_name}: {e}. Response was: {resp[:200]}...{W}") # Show snippet of bad response
             return self.subdomains
 
-        if resp_json.get('response_code') != '1': # Check response_code for success
-            logger.warning(f"{Y}ThreatCrowd API returned an error or no results for {self.domain}. Response: {resp_json.get('verbose_message', 'No message provided.')}{W}")
+        # ThreatCrowd uses 'response_code' which should be '1' for success
+        if resp_json.get('response_code') != '1': 
+            logger.warning(f"{Y}ThreatCrowd API returned an error or no results for {self.domain}. Message: {resp_json.get('verbose_message', 'No message provided.')}{W}")
             return self.subdomains
 
         self.extract_domains(resp_json)
@@ -615,24 +663,29 @@ class CrtSearch(enumratorBaseThreaded):
     def extract_domains(self, resp):
         links_list = []
         # Regex to find domain names in crt.sh output
-        link_regx = re.compile(r'(?:\<TD\>([^\<\>\s]+\.' + re.escape(self.domain) + r'))(?:\<\/TD\>)?')
+        # Adjusted regex to handle more cases and be more robust
+        link_regx = re.compile(r'(?:<TD>[^\<\>]*?([^\s]+\.' + re.escape(self.domain) + r')[^\<\>]*?</TD>|'
+                               r'(?:DNS|Common Name):?\s*([^\s]+\.' + re.escape(self.domain) + r'))', re.IGNORECASE)
         try:
             links = link_regx.findall(resp)
-            for link in links:
-                subdomain = link.strip()
-                if subdomain.startswith('*.'): # Handle wildcard certificates
-                    subdomain = subdomain[2:]
-                
-                # Further clean common artifacts from certificates
-                subdomain = subdomain.split('<BR>')[0].strip() # Take only the first domain if multiple
-                subdomain = subdomain.replace('<td>', '').replace('</td>', '') # Clean any remaining tags
-                subdomain = subdomain.lower() # Domains are case-insensitive
+            for match_tuple in links:
+                # Iterate through the tuple to find the actual match
+                for link in match_tuple:
+                    if link: # Check if the matched group is not empty
+                        subdomain = link.strip()
+                        if subdomain.startswith('*.'): # Handle wildcard certificates
+                            subdomain = subdomain[2:]
+                        
+                        # Further clean common artifacts from certificates
+                        subdomain = subdomain.split('<BR>')[0].strip() # Take only the first domain if multiple
+                        subdomain = subdomain.replace('<td>', '').replace('</td>', '') # Clean any remaining tags
+                        subdomain = subdomain.lower() # Domains are case-insensitive
 
-                if subdomain and subdomain not in self.subdomains and \
-                   subdomain.endswith(self.domain) and subdomain != self.domain:
-                    if self.verbose:
-                        self.print_(f"{R}{self.engine_name}: {W}{subdomain}")
-                    self.subdomains.append(subdomain)
+                        if subdomain and subdomain not in self.subdomains and \
+                           subdomain.endswith(self.domain) and subdomain != self.domain:
+                            if self.verbose:
+                                self.print_(f"{R}{self.engine_name}: {W}{subdomain}")
+                            self.subdomains.append(subdomain)
         except Exception as e:
             logger.error(f"{R}Error extracting domains from {self.engine_name}: {e}{W}")
 
@@ -663,39 +716,47 @@ class DNSdumpster(enumratorBaseThreaded):
                 pass
         return is_valid
 
-    def req(self, req_method, url, params=None):
-        params = params or {}
+    def send_req(self, url, method='GET', data=None, cookies=None): # Added method, data, cookies
         headers = dict(self.headers)
         headers['Referer'] = 'https://dnsdumpster.com'
         try:
-            if req_method == 'GET':
-                resp = self.session.get(url, headers=headers, timeout=self.timeout)
-            else: # Assuming POST for other methods, specifically for CSRF token
-                resp = self.session.post(url, headers=headers, data=params, timeout=self.timeout)
+            if method == 'GET':
+                resp = self.session.get(url, headers=headers, timeout=self.timeout, cookies=cookies)
+            elif method == 'POST':
+                resp = self.session.post(url, data=data, headers=headers, timeout=self.timeout, cookies=cookies)
             resp.raise_for_status()
         except requests.exceptions.RequestException as e:
             logger.error(f"{R}Request failed for {self.engine_name} at {url}: {e}{W}")
             return None
         return self.get_response(resp)
 
+    def get_csrftoken(self, resp_content):
+        # Regex to find the csrf_token hidden input
+        csrf_regex = re.compile(r'<input type="hidden" name="csrf_token" value="(.*?)">', re.S)
+        token_match = csrf_regex.search(resp_content)
+        if token_match:
+            return token_match.group(1).strip()
+        return None
+
+
     def enumerate(self):
         try:
             # Get CSRF token
-            initial_resp = self.req('GET', self.base_url)
-            if initial_resp is None:
+            initial_resp_content = self.send_req(self.base_url, method='GET')
+            if initial_resp_content is None:
                 return self.subdomains
             
-            csrf_token_match = re.search(r'<input type="hidden" name="csrf_token" value="([^"]+)">', initial_resp)
-            if not csrf_token_match:
+            csrf_token = self.get_csrftoken(initial_resp_content)
+            if not csrf_token:
                 logger.error(f"{R}CSRF token not found for DNSdumpster. Enumeration aborted.{W}")
                 return self.subdomains
-            csrf_token = csrf_token_match.group(1)
 
             data = {
                 'targetip': self.domain,
                 'csrf_token': csrf_token
             }
-            resp_content = self.req('POST', self.base_url, params=data)
+            # Use POST method with data and referer header
+            resp_content = self.send_req(self.base_url, method='POST', data=data)
             if resp_content is None:
                 return self.subdomains
 
@@ -722,10 +783,11 @@ class DNSdumpster(enumratorBaseThreaded):
 
     def extract_domains(self, resp):
         # Extract from tables (A records, MX records, NS records)
-        tables = re.findall(r'<table class=".*?">.*?</table>', resp, re.DOTALL)
+        # Relaxed regex to capture various table structures
+        tables = re.findall(r'<table\b[^>]*>(.*?)</table>', resp, re.DOTALL | re.IGNORECASE)
         for table in tables:
-            # Extract hostnames from table rows
-            hosts = re.findall(r'<tr>\s*<td class=".*?">\s*(.*?)\s*</td>', table)
+            # Extract hostnames from table rows, looking for typical IP/hostname patterns
+            hosts = re.findall(r'<td class="col-md-4">\s*(.*?)\s*(?:<br>|\s*</td>)', table, re.DOTALL | re.IGNORECASE)
             for host_entry in hosts:
                 # Clean up and normalize
                 subdomain = host_entry.split('<br/>')[0].strip()
@@ -764,8 +826,12 @@ class PassiveDNS(enumratorBaseThreaded):
             json_resp = json.loads(resp)
             if isinstance(json_resp, list): # The API returns a list of subdomains directly
                 self.extract_domains(json_resp)
+            else:
+                logger.warning(f"{Y}PassiveDNS response was not a list. Response: {resp[:200]}...{W}")
         except json.JSONDecodeError as e:
-            logger.error(f"{R}Error decoding JSON from {self.engine_name}: {e}{W}")
+            logger.error(f"{R}Error decoding JSON from {self.engine_name}: {e}. Response was: {resp[:200]}...{W}")
+        except Exception as e:
+            logger.error(f"{R}An unexpected error occurred during PassiveDNS enumeration: {e}{W}")
         
         return self.subdomains
 
@@ -778,6 +844,53 @@ class PassiveDNS(enumratorBaseThreaded):
                 self.subdomains.append(subdomain.strip())
 
 
+class portscan():
+    def __init__(self, subdomains, ports):
+        self.subdomains = subdomains
+        self.ports = ports
+        self.lock = threading.Lock() # Use threading.Lock for smaller scope
+
+    def port_scan(self, host, ports):
+        openports = []
+        # No need to acquire lock here if only modifying local list and printing
+        # The printing itself might be interleaved but that's usually acceptable for port scans.
+        # If writing to a shared resource, then a lock would be needed.
+        for port in ports:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                result = s.connect_ex((host, int(port)))
+                if result == 0:
+                    openports.append(str(port)) # Ensure port is string for join
+                s.close()
+            except Exception as e:
+                logger.debug(f"Port scan error for {host}:{port} - {e}")
+                pass
+        
+        if len(openports) > 0:
+            logger.info(f"{G}{host}{W} - {R}Found open ports:{W} {Y}{', '.join(openports)}{W}")
+
+    def run(self):
+        # Using a BoundedSemaphore to limit concurrent threads for port scanning
+        # 20 is a reasonable default to avoid overwhelming the network or hosts.
+        semaphore = threading.BoundedSemaphore(value=20) 
+        threads = []
+        for subdomain in self.subdomains:
+            semaphore.acquire() # Acquire a slot before starting thread
+            t = threading.Thread(target=self._run_port_scan_with_release, args=(subdomain, self.ports, semaphore))
+            threads.append(t)
+            t.start()
+        
+        for t in threads:
+            t.join() # Wait for all port scan threads to complete
+
+    def _run_port_scan_with_release(self, host, ports, semaphore):
+        try:
+            self.port_scan(host, ports)
+        finally:
+            semaphore.release() # Ensure release even if port_scan fails
+
+
 def main():
     args = parse_args()
 
@@ -788,8 +901,14 @@ def main():
 
     banner()
 
-    subdomains_queue = multiprocessing.Manager().list() # Use Manager().list() for shared list
-    subdomains_queue.append(args.domain) # Add the main domain to the list
+    # Using multiprocessing.Manager().list() for shared list between processes
+    # This is important for processes (like GoogleEnum etc.) to share found subdomains.
+    subdomains_queue = multiprocessing.Manager().list()
+    # Add the main domain to the queue if not already present.
+    # It might be found by engines, but ensure it's in the initial list for consistency.
+    if urlparse(args.domain).netloc not in subdomains_queue:
+        subdomains_queue.append(urlparse(args.domain).netloc or args.domain)
+
 
     # Define supported engines mapping
     supported_engines = {
@@ -802,7 +921,7 @@ def main():
         'virustotal': Virustotal,
         'threatcrowd': ThreatCrowd,
         'dnsdumpster': DNSdumpster,
-        'crtsearch': CrtSearch,
+        'crtsearch': CrtSearch, # Changed from 'ssl' to 'crtsearch' for consistency with class name
         'passivedns': PassiveDNS
     }
 
@@ -819,15 +938,19 @@ def main():
                 logger.warning(f"{Y}Engine '{engine_name}' is not supported. Skipping.{W}")
 
     # Start the engines enumeration
-    enums = [
-        enum_class(
-            args.domain,
-            list(subdomains_queue), # Pass a copy of initial subdomains if any
-            q=subdomains_queue,
-            silent=(not args.verbose), # Silent if not verbose
-            verbose=args.verbose
-        ) for enum_class in chosenEnums
-    ]
+    enums = []
+    for enum_class in chosenEnums:
+        # Pass a copy of the current subdomains for initial seeding for some enumerators if they use it.
+        # But the main communication is via subdomains_queue.
+        enums.append(
+            enum_class(
+                args.domain,
+                list(subdomains_queue), # Pass a copy, not the shared list directly for __init__
+                q=subdomains_queue,
+                silent=(not args.verbose),
+                verbose=args.verbose
+            )
+        )
 
     for enum_instance in enums:
         enum_instance.start()
@@ -843,34 +966,42 @@ def main():
 
     if args.bruteforce:
         logger.info(f"{G}Starting SubBrute bruteforce module...{W}")
-        # Subbrute will also append to subdomains_queue
-        # Passing unique_subdomains for subbrute to work on existing found subdomains
         try:
-            subbrute.main(args.domain, 
+            # subbrute.main will directly modify the subdomains_queue it's passed
+            subbrute.main(urlparse(args.domain).netloc, # Pass only the netloc for subbrute
                           output=args.output, 
                           threads=args.threads, 
-                          ipv4_only=False, # Assuming default to query all types
-                          subdomains_list=unique_subdomains # Pass current unique subdomains
+                          ipv4_only=False,
+                          subdomains_list=subdomains_queue # Pass the shared Manager().list()
             )
-            # After subbrute runs, we might need to re-sort and re-deduplicate
-            # as subbrute directly modifies the queue.
+            # After subbrute runs, the queue is updated, so re-sort and re-deduplicate
             unique_subdomains = sorted(list(set(subdomains_queue)), key=subdomain_sorting_key)
             if args.output:
-                write_file(args.output, unique_subdomains) # Overwrite with updated list
+                # Overwrite the output file with the updated list including bruteforce results
+                write_file(args.output, unique_subdomains) 
         except Exception as e:
             logger.error(f"{R}An error occurred during bruteforce: {e}{W}")
 
     # Final output of all found subdomains
     logger.info(f"\n{G}Found {len(unique_subdomains)} unique subdomains for {args.domain}:{W}")
-    for subdomain in unique_subdomains:
-        logger.info(f"{B}{subdomain}{W}")
+    if unique_subdomains:
+        for subdomain in unique_subdomains:
+            logger.info(f"{B}{subdomain}{W}")
+    else:
+        logger.info(f"{Y}No subdomains found for {args.domain}.{W}")
+
 
     if args.ports:
-        logger.info(f"{G}Scanning ports for found subdomains (feature not implemented in detail yet, conceptual)...{W}")
-        # This part would require a separate port scanning module/logic
-        # For a real implementation, you'd iterate through unique_subdomains
-        # and attempt to connect to specified ports.
-        logger.warning(f"{Y}Port scanning functionality is a placeholder. Needs full implementation.{W}")
+        if unique_subdomains:
+            logger.info(f"{G}Starting port scan now for the following ports: {Y}{args.ports}{W}")
+            ports_list = [p.strip() for p in args.ports.split(',') if p.strip().isdigit()]
+            if ports_list:
+                pscan = portscan(unique_subdomains, ports_list)
+                pscan.run()
+            else:
+                logger.warning(f"{Y}No valid ports specified for scanning. Skipping port scan.{W}")
+        else:
+            logger.warning(f"{Y}No subdomains found to perform port scan on. Skipping.{W}")
 
 
 if __name__ == "__main__":
